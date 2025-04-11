@@ -2,7 +2,7 @@
 
 ## Context
 
-I approached [Gleam](https://gleam.run) expecting a modern, friendly way
+We approached [Gleam](https://gleam.run) expecting a modern, friendly way
 of writing concurrent and distributed systems for the
 [Erlang runtime](https://en.wikipedia.org/wiki/BEAM_(Erlang_virtual_machine)).
 

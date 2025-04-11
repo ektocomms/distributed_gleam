@@ -1,3 +1,4 @@
+import argv
 import gleam/dynamic
 import gleam/dynamic/decode
 import gleam/erlang/atom
@@ -5,7 +6,6 @@ import gleam/erlang/node
 import gleam/erlang/process
 import gleam/io
 import gleam/string
-import argv
 import glint
 
 // This works but uses start/1, which is deprecated
