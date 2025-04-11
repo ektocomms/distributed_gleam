@@ -1,15 +1,16 @@
-import argv
-import gleam/erlang/process
-import gleam/erlang/node
-import gleam/io
-import gleam/list
-import gleam/string
 import gleam/dynamic
+import gleam/dynamic/decode
 import gleam/erlang/atom
+import gleam/erlang/node
+import gleam/erlang/process
+import gleam/io
+import gleam/string
+import argv
 import glint
 
 // This works but uses start/1, which is deprecated
 // https://www.erlang.org/doc/apps/kernel/net_kernel.html#start/1
+//
 //    @external(erlang, "net_kernel", "start")
 //    fn net_kernel_start_1(
 //      name: List(atom.Atom),
@@ -29,19 +30,28 @@ type NameDomain {
 }
 
 type NetStartOptions {
-  NetStartOptions( // this will be called net_start_options inside Erlang
-      name_domain: NameDomain,
-      net_ticktime: Int,
-      net_tickintensity: Int,
-      dist_listen: Bool,
-      hidden: Bool)
+  NetStartOptions(
+    // this will be called net_start_options inside Erlang
+    name_domain: NameDomain,
+    net_ticktime: Int,
+    net_tickintensity: Int,
+    dist_listen: Bool,
+    hidden: Bool,
+  )
 }
 
 @external(erlang, "net_kernel_start_wrapper", "net_kernel_start_2")
-fn net_kernel_start_2(name: String,
-                      options: NetStartOptions)
-    -> Result(process.Pid, dynamic.Dynamic)
+fn net_kernel_start_2(
+  name: String,
+  options: NetStartOptions,
+) -> Result(process.Pid, dynamic.Dynamic)
 
+@external(erlang, "erlang", "set_cookie")
+fn set_cookie(cookie: atom.Atom) -> Bool
+
+type Message {
+  Hello(to: String)
+}
 
 pub fn main() {
   glint.new()
@@ -73,14 +83,22 @@ fn from_cli() -> glint.Command(Nil) {
 }
 
 fn up(ego: String, illum: String) {
-  go_distributed(ego, illum)
-  process.sleep(100)
+  let addr = "127.0.0.1"
+  let assert Ok(_) = go_distributed(ego, addr)
+
+  // Connect to the other node
+  let illum_node = connect(illum <> "@" <> addr)
+
+  // Spawn a listener named process than can be
+  // reached by the other node
+  let listener_name = spawn_named_listener()
+
+  // Now we can send something to the other "listener":
+  speaker_loop(illum_node, listener_name, Hello(illum))
 }
 
-fn go_distributed(ego: String, _illum: String) {
-  let addr = "127.0.0.1"
-
-  //  let _net_kernel_start_1_options = [
+fn go_distributed(ego: String, addr: String) {
+  //  let net_kernel_start_1_options = [
   //    // Choose short ot long names:
   //    // atom.create_from_string(ego),
   //    // atom.create_from_string("shortnames"),
@@ -88,21 +106,100 @@ fn go_distributed(ego: String, _illum: String) {
   //    atom.create_from_string("longnames"),
   //    ]
 
-  let net_kernel_start_2_options = NetStartOptions(
-    name_domain: Longnames, // ShortNames,
-    net_ticktime: 60,
-    net_tickintensity: 4,
-    dist_listen: True,
-    hidden: False)
+  let net_kernel_start_2_options =
+    NetStartOptions(
+      name_domain: Longnames,
+      // ShortNames,
+      net_ticktime: 60,
+      net_tickintensity: 4,
+      dist_listen: True,
+      hidden: False,
+    )
 
-  // let result = net_kernel_start_1(net_kernel_start_1_options)
-  let result = net_kernel_start_2(ego <> "@" <> addr,
-                                  net_kernel_start_2_options)
-
-  case result {
-    Ok(pid) -> io.println("Network Kernel started with PID: " <> string.inspect(pid))
-    Error(e) -> io.println("Network Kernel failed to start: " <> string.inspect(e))
+  //   net_kernel_start_1(net_kernel_start_1_options)
+  case net_kernel_start_2(ego <> "@" <> addr, net_kernel_start_2_options) {
+    Ok(pid) -> {
+      io.println("Network Kernel started with PID: " <> string.inspect(pid))
+      set_cookie(atom.create_from_string("secret_cookie"))
+      Ok(pid)
+    }
+    Error(e) -> {
+      io.println("Network Kernel failed to start: " <> string.inspect(e))
+      Error(e)
+    }
   }
-  echo atom.to_string(node.to_atom(node.self()))
-  echo list.map(node.visible(), fn (n) {atom.to_string(node.to_atom(n))})
+}
+
+fn connect(to: String) -> node.Node {
+  io.println("Trying to connect to: " <> to)
+  case node.connect(atom.create_from_string(to)) {
+    Ok(n) -> {
+      io.println("Connected to: " <> to)
+      n
+    }
+    Error(_) -> {
+      process.sleep(100)
+      connect(to)
+    }
+  }
+}
+
+fn spawn_named_listener() -> atom.Atom {
+  let listener_name = atom.create_from_string("listener")
+  let _ =
+    process.start(
+      fn() {
+        let _ = process.register(process.self(), listener_name)
+        listener_loop()
+      },
+      True,
+    )
+  listener_name
+}
+
+fn listener_loop() {
+  case
+    process.select_forever(process.selecting_anything(
+      process.new_selector(),
+      decode_message,
+    ))
+  {
+    Ok(msg) ->
+      case msg {
+        Hello(to) -> io.println("Received Hello: " <> to)
+      }
+    Error(e) -> io.println("Error decoding: " <> string.inspect(e))
+  }
+  listener_loop()
+}
+
+fn speaker_loop(node: node.Node, name: atom.Atom, msg: Message) {
+  node.send(node, name, msg)
+  process.sleep(1000)
+  speaker_loop(node, name, msg)
+}
+
+fn atom_decoder() -> decode.Decoder(atom.Atom) {
+  use data <- decode.new_primitive_decoder("Atom")
+  case atom.from_dynamic(data) {
+    Ok(a) -> Ok(a)
+    Error(_) -> Error(atom.create_from_string("null"))
+  }
+}
+
+fn decode_message(
+  data: dynamic.Dynamic,
+) -> Result(Message, List(decode.DecodeError)) {
+  // Erlang sends Gleam Records as Tuples
+  // The first element is an atom with the name of the constructor
+  let decoder = {
+    use constructor <- decode.field(0, atom_decoder())
+    use to <- decode.field(1, decode.string)
+    let constructor_string = atom.to_string(constructor)
+    case constructor_string {
+      "hello" -> decode.success(Hello(to))
+      x -> decode.failure(Hello(""), x)
+    }
+  }
+  decode.run(data, decoder)
 }
